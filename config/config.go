@@ -81,6 +81,12 @@ type Account struct {
 	NextResetDate string  `json:"nextResetDate,omitempty"` // Date when usage resets (YYYY-MM-DD)
 	LastRefresh   int64   `json:"lastRefresh,omitempty"`   // Last info refresh timestamp
 
+	BonusUsageKnown         bool    `json:"bonusUsageKnown"`
+	BonusUsageCurrent       float64 `json:"bonusUsageCurrent"`
+	BonusUsageLimit         float64 `json:"bonusUsageLimit"`
+	BonusUsageExpiresAt     int64   `json:"bonusUsageExpiresAt,omitempty"` // Earliest active expiry, Unix milliseconds
+	BonusUsageExpiryChecked bool    `json:"bonusUsageExpiryChecked,omitempty"`
+
 	// Trial usage tracking
 	TrialUsageCurrent float64 `json:"trialUsageCurrent,omitempty"` // Trial quota current usage
 	TrialUsageLimit   float64 `json:"trialUsageLimit,omitempty"`   // Trial quota total limit
@@ -178,16 +184,22 @@ type Config struct {
 // AccountInfo contains account metadata retrieved from Kiro API.
 // Used for updating subscription and usage information.
 type AccountInfo struct {
-	Email             string
-	UserId            string
-	SubscriptionType  string
-	SubscriptionTitle string
-	DaysRemaining     int
-	UsageCurrent      float64
-	UsageLimit        float64
-	UsagePercent      float64
-	NextResetDate     string
-	LastRefresh       int64
+	Email                   string
+	UserId                  string
+	SubscriptionType        string
+	SubscriptionTitle       string
+	DaysRemaining           int
+	UsageCurrent            float64
+	UsageLimit              float64
+	UsagePercent            float64
+	NextResetDate           string
+	LastRefresh             int64
+	BonusUsageKnown         bool    `json:"bonusUsageKnown"`
+	BonusUsageCurrent       float64 `json:"bonusUsageCurrent"`
+	BonusUsageLimit         float64 `json:"bonusUsageLimit"`
+	BonusUsageExpiresAt     int64   `json:"bonusUsageExpiresAt,omitempty"` // Earliest active expiry, Unix milliseconds
+	BonusUsageExpiryChecked bool    `json:"bonusUsageExpiryChecked,omitempty"`
+
 	TrialUsageCurrent float64
 	TrialUsageLimit   float64
 	TrialUsagePercent float64
@@ -510,6 +522,11 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 			cfg.Accounts[i].UsagePercent = info.UsagePercent
 			cfg.Accounts[i].NextResetDate = info.NextResetDate
 			cfg.Accounts[i].LastRefresh = info.LastRefresh
+			cfg.Accounts[i].BonusUsageKnown = info.BonusUsageKnown
+			cfg.Accounts[i].BonusUsageCurrent = info.BonusUsageCurrent
+			cfg.Accounts[i].BonusUsageLimit = info.BonusUsageLimit
+			cfg.Accounts[i].BonusUsageExpiresAt = info.BonusUsageExpiresAt
+			cfg.Accounts[i].BonusUsageExpiryChecked = info.BonusUsageExpiryChecked
 			cfg.Accounts[i].TrialUsageCurrent = info.TrialUsageCurrent
 			cfg.Accounts[i].TrialUsageLimit = info.TrialUsageLimit
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent

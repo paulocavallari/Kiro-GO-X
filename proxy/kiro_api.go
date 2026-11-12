@@ -7,6 +7,7 @@ import (
 	"kiro-go-x/auth"
 	"kiro-go-x/config"
 	"kiro-go-x/logger"
+	"math"
 	"net/http"
 	neturl "net/url"
 	"strings"
@@ -316,6 +317,9 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		}
 	}
 
+	info.BonusUsageKnown, info.BonusUsageCurrent, info.BonusUsageLimit, info.BonusUsageExpiresAt = bonusUsageSnapshot(usage.UsageBreakdownList, time.Now())
+	info.BonusUsageExpiryChecked = true
+
 	// 解析重置日期
 	if usage.NextDateReset != "" {
 		if ts, err := usage.NextDateReset.Int64(); err == nil && ts > 0 {
@@ -391,12 +395,81 @@ type FreeTrialInfo struct {
 }
 
 type BonusInfo struct {
-	BonusCode    string      `json:"bonusCode"`
-	DisplayName  string      `json:"displayName"`
-	CurrentUsage float64     `json:"currentUsage"`
-	UsageLimit   float64     `json:"usageLimit"`
-	ExpiresAt    json.Number `json:"expiresAt"`
-	Status       string      `json:"status"`
+	BonusCode                 string      `json:"bonusCode"`
+	DisplayName               string      `json:"displayName"`
+	CurrentUsage              *float64    `json:"currentUsage"`
+	UsageLimit                *float64    `json:"usageLimit"`
+	CurrentUsageWithPrecision *float64    `json:"currentUsageWithPrecision"`
+	UsageLimitWithPrecision   *float64    `json:"usageLimitWithPrecision"`
+	ExpiresAt                 json.Number `json:"expiresAt"`
+	Status                    string      `json:"status"`
+}
+
+// bonusUsage reports only explicitly supplied active bonus credits, never base quota.
+func bonusUsage(breakdowns []UsageBreakdown, now time.Time) (bool, float64, float64) {
+	known, current, limit, _ := bonusUsageSnapshot(breakdowns, now)
+	return known, current, limit
+}
+
+// Expiry is persisted in milliseconds; rounding down is deliberately conservative.
+func bonusUsageSnapshot(breakdowns []UsageBreakdown, now time.Time) (bool, float64, float64, int64) {
+	if len(breakdowns) == 0 {
+		return false, 0, 0, 0
+	}
+	var current, limit float64
+	var earliest int64
+	for _, breakdown := range breakdowns {
+		if breakdown.Bonuses == nil {
+			return false, 0, 0, 0
+		}
+		for _, bonus := range breakdown.Bonuses {
+			switch bonus.Status {
+			case "EXPIRED", "INACTIVE":
+				continue
+			case "ACTIVE":
+			default:
+				return false, 0, 0, 0
+			}
+			var expires int64
+			if bonus.ExpiresAt != "" {
+				expiry, err := bonus.ExpiresAt.Float64()
+				if err != nil || math.IsNaN(expiry) || math.IsInf(expiry, 0) || expiry < 0 {
+					return false, 0, 0, 0
+				}
+				if expiry > 0 {
+					if expiry < 1e11 {
+						expiry *= 1000
+					}
+					if expiry > 253402300799000 || expiry < 1 {
+						return false, 0, 0, 0
+					}
+					expires = int64(expiry)
+					if expires <= now.UnixMilli() {
+						continue
+					}
+				}
+			}
+			used, total := bonus.CurrentUsage, bonus.UsageLimit
+			if bonus.CurrentUsageWithPrecision != nil {
+				used = bonus.CurrentUsageWithPrecision
+			}
+			if bonus.UsageLimitWithPrecision != nil {
+				total = bonus.UsageLimitWithPrecision
+			}
+			if used == nil || total == nil || *used < 0 || *total < 0 || math.IsNaN(*used) || math.IsNaN(*total) || math.IsInf(*used, 0) || math.IsInf(*total, 0) {
+				return false, 0, 0, 0
+			}
+			current += *used
+			limit += *total
+			if math.IsInf(current, 0) || math.IsInf(limit, 0) {
+				return false, 0, 0, 0
+			}
+			if expires > 0 && (earliest == 0 || expires < earliest) {
+				earliest = expires
+			}
+		}
+	}
+	return true, current, limit, earliest
 }
 
 type SubscriptionInfo struct {

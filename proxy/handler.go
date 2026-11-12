@@ -2121,6 +2121,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	for i, a := range accounts {
 		// 获取运行时统计
 		stats := statsMap[a.ID]
+		a = bonusSnapshotForRead(a, time.Now())
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -2144,6 +2145,9 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
+			"bonusUsageKnown":   a.BonusUsageKnown,
+			"bonusUsageCurrent": a.BonusUsageCurrent,
+			"bonusUsageLimit":   a.BonusUsageLimit,
 			"usageCurrent":      a.UsageCurrent,
 			"usageLimit":        a.UsageLimit,
 			"usagePercent":      a.UsagePercent,
@@ -3043,6 +3047,16 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	})
 }
 
+// bonusSnapshotForRead refuses stale and pre-expiry-tracking snapshots.
+func bonusSnapshotForRead(a config.Account, now time.Time) config.Account {
+	if !a.BonusUsageExpiryChecked || (a.BonusUsageExpiresAt > 0 && now.UnixMilli() >= a.BonusUsageExpiresAt) {
+		a.BonusUsageKnown = false
+		a.BonusUsageCurrent = 0
+		a.BonusUsageLimit = 0
+	}
+	return a
+}
+
 // apiGetAccountFull 获取单个账号的完整信息（包含敏感字段）
 func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id string) {
 	accounts := config.GetAccounts()
@@ -3073,6 +3087,8 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 	}
 
 	// 返回完整账号信息（包含敏感字段）
+	snapshot := bonusSnapshotForRead(*account, time.Now())
+	account = &snapshot
 	result := map[string]interface{}{
 		"id":                account.ID,
 		"email":             account.Email,
@@ -3098,6 +3114,9 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"subscriptionType":  account.SubscriptionType,
 		"subscriptionTitle": account.SubscriptionTitle,
 		"daysRemaining":     account.DaysRemaining,
+		"bonusUsageKnown":   account.BonusUsageKnown,
+		"bonusUsageCurrent": account.BonusUsageCurrent,
+		"bonusUsageLimit":   account.BonusUsageLimit,
 		"usageCurrent":      account.UsageCurrent,
 		"usageLimit":        account.UsageLimit,
 		"usagePercent":      account.UsagePercent,

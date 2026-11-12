@@ -795,6 +795,23 @@
     });
   }
 
+  function renderBonusUsage(a) {
+    const label = t('accounts.bonusQuota');
+    const current = a.bonusUsageCurrent;
+    const limit = a.bonusUsageLimit;
+    if (a.bonusUsageKnown !== true || !Number.isFinite(current) || !Number.isFinite(limit) || current < 0 || limit < 0) {
+      return '<div class="account-usage"><div class="usage-label">' + escapeHtml(label) + '</div><div class="usage-text">' + escapeHtml(t('accounts.bonusUnavailable')) + '</div></div>';
+    }
+    const pct = limit > 0 ? Math.min(100, current / limit * 100) : (current > 0 ? 100 : 0);
+    const usageClass = pct > 90 ? 'critical' : pct > 70 ? 'high' : '';
+    const used = t('accounts.bonusUsed') + ': ' + current.toFixed(2) + ' / ' + limit.toFixed(2);
+    const remaining = t('accounts.bonusRemaining') + ': ' + Math.max(0, limit - current).toFixed(2);
+    return '<div class="account-usage">' +
+      '<div class="usage-label">' + escapeHtml(label) + '</div>' +
+      '<div class="usage-bar" role="progressbar" aria-label="' + escapeAttr(label) + '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '" aria-valuetext="' + escapeAttr(used + ', ' + remaining) + '"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + pct + '"></div></div>' +
+      '<div class="usage-text"><span>' + escapeHtml(used) + '</span><span>' + escapeHtml(remaining) + '</span></div></div>';
+  }
+
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
@@ -856,6 +873,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(usagePct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0) + '</span><span>' + usagePct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        renderBonusUsage(a) +
         (a.trialUsageLimit > 0 ?
           '<div class="account-usage">' +
           '<div class="usage-label">' + escapeHtml(t('accounts.trialQuota')) + ' ' + escapeHtml(formatTrialExpiry(a.trialExpiresAt)) + '</div>' +
