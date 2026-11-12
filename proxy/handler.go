@@ -1,4 +1,4 @@
-﻿package proxy
+package proxy
 
 import (
 	"encoding/json"
@@ -2839,6 +2839,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		h.pool.Reload()
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

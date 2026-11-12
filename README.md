@@ -19,12 +19,19 @@ If this project helps you, a Star would mean a lot.
 - Usage tracking, account import/export, i18n (CN / EN)
 - Support configuring outbound proxy (SOCKS5 / HTTP)
 
+## Fork changes
+
+- The default Kiro IDE version is `1.4.121`; an explicit `kiroVersion` configuration still takes precedence.
+- Builder ID (`provider=BuilderId`, `authMethod=idc`) uses a known default profile ARN for generation when no account ARN is configured. Explicit ARNs take precedence. Other account types do not use this fallback.
+- The global over-usage setting is applied when the account pool is built and takes effect immediately when changed. It applies only to enabled accounts. A per-account permission also allows that account beyond its displayed quota, even when the global setting is off. To block all over-quota use, disable both the global and per-account permissions.
+- Over-usage only changes local account selection; it does not purchase credits or change Kiro billing. Available balances, provider policies, and charges must be checked with Kiro.
+
 ## Quick Start
 
 ### Docker Compose (Recommended)
 
 ```bash
-git clone https://github.com/icaruszezen/Kiro-GO-X.git
+git clone https://github.com/paulocavallari/Kiro-GO-X.git
 cd Kiro-GO-X
 mkdir -p data
 docker-compose up -d
@@ -45,7 +52,7 @@ docker run -d \
 ### Build from Source
 
 ```bash
-git clone https://github.com/icaruszezen/Kiro-GO-X.git
+git clone https://github.com/paulocavallari/Kiro-GO-X.git
 cd Kiro-GO-X
 go build -o kiro-go-x .
 ./kiro-go-x

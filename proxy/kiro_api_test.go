@@ -1,9 +1,10 @@
-﻿package proxy
+package proxy
 
 import (
 	"io"
 	"kiro-go-x/config"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,4 +94,53 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestBuilderIDProfileFallback(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	kiroRestHttpStore.Store(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"profiles":[]}`)), Header: make(http.Header)}, nil
+	})})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+	const fallback = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+	cases := []struct {
+		name    string
+		account *config.Account
+		want    string
+	}{
+		{"builder", &config.Account{Provider: "BuilderId", AuthMethod: "idc"}, fallback},
+		{"builder normalized", &config.Account{Provider: " builderid ", AuthMethod: " IDC "}, fallback},
+		{"explicit builder", &config.Account{Provider: "BuilderId", AuthMethod: "idc", ProfileArn: " explicit "}, "explicit"},
+		{"explicit enterprise", &config.Account{Provider: "Enterprise", AuthMethod: "idc", ProfileArn: " enterprise-arn "}, "enterprise-arn"},
+		{"enterprise idc", &config.Account{Provider: "Enterprise", AuthMethod: "idc"}, ""},
+		{"unidentified idc", &config.Account{AuthMethod: "idc"}, ""},
+		{"social", &config.Account{Provider: "Google", AuthMethod: "social"}, ""},
+		{"contradictory social", &config.Account{Provider: "BuilderId", AuthMethod: "social"}, ""},
+		{"unknown method", &config.Account{Provider: "BuilderId"}, ""},
+		{"nil", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "https://example.com/path?origin=test"
+			u, err := url.Parse(withProfileArnQuery(raw, tc.account))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantQuery := ""
+			if tc.account != nil {
+				wantQuery = strings.TrimSpace(tc.account.ProfileArn)
+			}
+			if got := u.Query().Get("profileArn"); got != wantQuery {
+				t.Errorf("query profile ARN = %q, want %q", got, wantQuery)
+			}
+			if tc.account != nil {
+				got, err := ResolveProfileArn(tc.account)
+				if got != tc.want || (tc.want == "") != (err != nil) {
+					t.Errorf("resolve = %q, %v; want %q", got, err, tc.want)
+				}
+			}
+		})
+	}
 }

@@ -1,4 +1,4 @@
-﻿package proxy
+package proxy
 
 import (
 	"encoding/json"
@@ -660,5 +660,45 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+func TestUpdateSettingsReloadsOverUsageImmediately(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []config.Account{
+		{ID: "global", Enabled: true, UsageCurrent: 10, UsageLimit: 10},
+		{ID: "individual", Enabled: true, UsageCurrent: 10, UsageLimit: 10, AllowOverage: true},
+		{ID: "disabled", Enabled: false, UsageCurrent: 10, UsageLimit: 10},
+	} {
+		if err := config.AddAccount(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := accountpool.GetPool()
+	p.ResetRuntimeState()
+	p.Reload()
+	h := &Handler{pool: p}
+	for _, step := range []struct {
+		body   string
+		global bool
+	}{{`{"allowOverUsage":true}`, true}, {`{"allowOverUsage":false}`, false}} {
+		rec := httptest.NewRecorder()
+		h.apiUpdateSettings(rec, httptest.NewRequest(http.MethodPost, "/settings", strings.NewReader(step.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("update: %d %s", rec.Code, rec.Body.String())
+		}
+		a := p.GetNextExcluding(map[string]bool{"individual": true})
+		if step.global && (a == nil || a.ID != "global") {
+			t.Errorf("enabled: got %v", a)
+		}
+		if !step.global && a != nil {
+			t.Errorf("disabled: got %v", a)
+		}
+		a = p.GetNextExcluding(map[string]bool{"global": true})
+		if a == nil || a.ID != "individual" {
+			t.Errorf("individual lost: %v", a)
+		}
 	}
 }

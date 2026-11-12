@@ -1,4 +1,4 @@
-﻿package pool
+package pool
 
 import (
 	"errors"
@@ -266,5 +266,52 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 	acc := p.GetNextForModelExcluding("claude-sonnet-4.5", map[string]bool{"a": true})
 	if acc == nil || acc.ID != "b" {
 		t.Fatalf("expected account b, got %#v", acc)
+	}
+}
+
+func TestReloadGlobalOverUsageEligibility(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []config.Account{
+		{ID: "global", Enabled: true, UsageCurrent: 10, UsageLimit: 10, OverageWeight: 3},
+		{ID: "individual", Enabled: true, UsageCurrent: 10, UsageLimit: 10, AllowOverage: true, OverageWeight: 2},
+		{ID: "disabled", Enabled: false, UsageCurrent: 10, UsageLimit: 10, AllowOverage: true},
+	} {
+		if err := config.AddAccount(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := newTestPool()
+	for _, global := range []bool{false, true, false} {
+		if err := config.UpdateAllowOverUsage(global); err != nil {
+			t.Fatal(err)
+		}
+		p.Reload()
+		counts := map[string]int{}
+		for _, a := range p.accounts {
+			counts[a.ID]++
+		}
+		if counts["individual"] != 2 || counts["disabled"] != 0 {
+			t.Fatalf("global=%v: counts %v", global, counts)
+		}
+		want := 0
+		if global {
+			want = 3
+		}
+		if counts["global"] != want {
+			t.Errorf("global=%v: counts %v, want global weight %d", global, counts, want)
+		}
+		for _, selectAccount := range []func() *config.Account{func() *config.Account { return p.GetNextExcluding(map[string]bool{"individual": true}) }, func() *config.Account {
+			return p.GetNextForModelExcluding("model", map[string]bool{"individual": true})
+		}} {
+			a := selectAccount()
+			if global && (a == nil || a.ID != "global") {
+				t.Errorf("global=true: got %v", a)
+			}
+			if !global && a != nil {
+				t.Errorf("global=false: got %v", a)
+			}
+		}
 	}
 }

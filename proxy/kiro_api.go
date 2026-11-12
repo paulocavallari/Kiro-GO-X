@@ -1,4 +1,4 @@
-﻿package proxy
+package proxy
 
 import (
 	"encoding/json"
@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	kiroRestAPIBase = "https://codewhisperer.us-east-1.amazonaws.com"
+	kiroRestAPIBase            = "https://codewhisperer.us-east-1.amazonaws.com"
+	builderIDDefaultProfileArn = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 )
 
 // GetUsageLimits 获取账户使用量和订阅信息
@@ -110,14 +111,13 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	return result.Models, nil
 }
 
-// ResolveProfileArn returns the account profile ARN, fetching and caching it
-// when it is missing. First tries ListAvailableProfiles; if that returns empty,
-// falls back to refreshing the token (which returns profileArn in the response).
+// ResolveProfileArn returns the explicit ARN or the Builder ID default. For other
+// accounts it discovers and caches an ARN via profiles or token refresh.
 func ResolveProfileArn(account *config.Account) (string, error) {
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
 	}
-	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
+	if profileArn := effectiveProfileArn(account); profileArn != "" {
 		return profileArn, nil
 	}
 
@@ -181,11 +181,22 @@ func listAvailableProfiles(account *config.Account) (string, error) {
 	return "", fmt.Errorf("empty profile list")
 }
 
-func withProfileArnQuery(rawURL string, account *config.Account) string {
+func effectiveProfileArn(account *config.Account) string {
 	if account == nil {
-		return rawURL
+		return ""
 	}
 	profileArn := strings.TrimSpace(account.ProfileArn)
+	if profileArn == "" && strings.EqualFold(strings.TrimSpace(account.Provider), "BuilderId") && strings.EqualFold(strings.TrimSpace(account.AuthMethod), "idc") {
+		return builderIDDefaultProfileArn
+	}
+	return profileArn
+}
+
+func withProfileArnQuery(rawURL string, account *config.Account) string {
+	profileArn := ""
+	if account != nil {
+		profileArn = strings.TrimSpace(account.ProfileArn)
+	}
 	if profileArn == "" {
 		return rawURL
 	}
