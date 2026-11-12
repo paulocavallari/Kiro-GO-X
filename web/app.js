@@ -799,17 +799,18 @@
     const label = t('accounts.bonusQuota');
     const current = a.bonusUsageCurrent;
     const limit = a.bonusUsageLimit;
-    if (a.bonusUsageKnown !== true || !Number.isFinite(current) || !Number.isFinite(limit) || current < 0 || limit < 0) {
+    if (a.bonusUsageKnown !== true || !Number.isFinite(current) || !Number.isFinite(limit) || current < 0 || limit < 0 || (limit === 0 && current > 0)) {
       return '<div class="account-usage"><div class="usage-label">' + escapeHtml(label) + '</div><div class="usage-text">' + escapeHtml(t('accounts.bonusUnavailable')) + '</div></div>';
     }
-    const pct = limit > 0 ? Math.min(100, current / limit * 100) : (current > 0 ? 100 : 0);
+    const usedPct = limit > 0 ? current / limit * 100 : 0;
+    const pct = Math.min(100, usedPct);
     const usageClass = pct > 90 ? 'critical' : pct > 70 ? 'high' : '';
-    const used = t('accounts.bonusUsed') + ': ' + current.toFixed(2) + ' / ' + limit.toFixed(2);
-    const remaining = t('accounts.bonusRemaining') + ': ' + Math.max(0, limit - current).toFixed(2);
+    const used = current.toFixed(2) + ' / ' + limit.toFixed(2);
+    const percentage = usedPct.toFixed(1) + '%';
     return '<div class="account-usage">' +
       '<div class="usage-label">' + escapeHtml(label) + '</div>' +
-      '<div class="usage-bar" role="progressbar" aria-label="' + escapeAttr(label) + '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '" aria-valuetext="' + escapeAttr(used + ', ' + remaining) + '"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + pct + '"></div></div>' +
-      '<div class="usage-text"><span>' + escapeHtml(used) + '</span><span>' + escapeHtml(remaining) + '</span></div></div>';
+      '<div class="usage-bar" role="progressbar" aria-label="' + escapeAttr(label) + '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '" aria-valuetext="' + escapeAttr(t('accounts.bonusUsed') + ': ' + used + ', ' + percentage) + '"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + pct + '"></div></div>' +
+      '<div class="usage-text"><span>' + escapeHtml(used) + '</span><span>' + escapeHtml(percentage) + '</span></div></div>';
   }
 
   function renderAccounts() {
