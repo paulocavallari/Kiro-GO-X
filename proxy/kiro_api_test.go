@@ -96,6 +96,40 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
 
+func TestUsageLimitsUsesBuilderIDFallbackWithoutChangingOtherAccounts(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		account config.Account
+		wantARN string
+	}{
+		{"builder without ARN", config.Account{Provider: "BuilderId", AuthMethod: "idc"}, builderIDDefaultProfileArn},
+		{"builder with explicit ARN", config.Account{Provider: "BuilderId", AuthMethod: "idc", ProfileArn: " explicit-arn "}, "explicit-arn"},
+		{"enterprise without ARN", config.Account{Provider: "Enterprise", AuthMethod: "idc"}, ""},
+		{"enterprise with ARN", config.Account{Provider: "Enterprise", AuthMethod: "idc", ProfileArn: "enterprise-arn"}, "enterprise-arn"},
+		{"social without ARN", config.Account{Provider: "Google", AuthMethod: "social"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kiroRestHttpStore.Store(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/getUsageLimits" {
+					t.Fatalf("unexpected path: %s", req.URL.Path)
+				}
+				if got := req.URL.Query().Get("profileArn"); got != tc.wantARN {
+					t.Errorf("profileArn = %q, want %q", got, tc.wantARN)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"usageBreakdownList":[]}`)), Header: make(http.Header)}, nil
+			})})
+			if _, err := GetUsageLimits(&tc.account); err != nil {
+				t.Fatalf("GetUsageLimits: %v", err)
+			}
+		})
+	}
+	t.Cleanup(func() { InitKiroHttpClient("") })
+}
+
 func TestBuilderIDProfileFallback(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatal(err)

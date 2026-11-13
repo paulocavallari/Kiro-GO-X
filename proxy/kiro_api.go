@@ -22,7 +22,11 @@ const (
 // GetUsageLimits 获取账户使用量和订阅信息
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestAPIBase)
-	url = withProfileArnQuery(url, account)
+	// Builder ID accounts can be created without a stored ARN. Use the same
+	// Builder ID fallback as generation, but only for this usage endpoint.
+	if profileArn := effectiveProfileArn(account); profileArn != "" {
+		url += "&profileArn=" + neturl.QueryEscape(profileArn)
+	}
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
