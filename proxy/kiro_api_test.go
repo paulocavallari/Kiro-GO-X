@@ -3,11 +3,13 @@ package proxy
 import (
 	"io"
 	"kiro-go-x/config"
+	accountpool "kiro-go-x/pool"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveProfileArnReturnsCachedValueWithoutRequest(t *testing.T) {
@@ -90,6 +92,57 @@ func TestResolveProfileArnFetchesAndCachesProfile(t *testing.T) {
 	}
 }
 
+func TestResolveProfileArnSynchronizesCachedValueToPoolSnapshots(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	account := config.Account{
+		ID: "pool-profile-cache", Provider: "Enterprise", AuthMethod: "idc",
+		AccessToken: "access-token", Region: "us-east-1", Enabled: true,
+	}
+	if err := config.AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.ResetRuntimeState()
+	p.Reload()
+
+	calls := 0
+	kiroRestHttpStore.Store(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if req.URL.Path != "/ListAvailableProfiles" {
+			t.Fatalf("unexpected request path: %s", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"profiles":[{"arn":"arn:cached-in-pool"}]}`)),
+			Header:     make(http.Header),
+		}, nil
+	})})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	firstSnapshot := p.GetByID(account.ID)
+	if firstSnapshot == nil {
+		t.Fatal("account missing from pool")
+	}
+	got, err := ResolveProfileArn(firstSnapshot)
+	if err != nil || got != "arn:cached-in-pool" {
+		t.Fatalf("first profile resolution = %q, %v", got, err)
+	}
+	if pooled := p.GetByID(account.ID); pooled == nil || pooled.ProfileArn != got {
+		t.Fatalf("pool snapshot profile ARN = %#v, want %q", pooled, got)
+	}
+
+	secondSnapshot := p.GetByID(account.ID)
+	got, err = ResolveProfileArn(secondSnapshot)
+	if err != nil || got != "arn:cached-in-pool" {
+		t.Fatalf("second profile resolution = %q, %v", got, err)
+	}
+	if calls != 1 {
+		t.Fatalf("ListAvailableProfiles calls = %d, want 1", calls)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -130,6 +183,60 @@ func TestUsageLimitsUsesBuilderIDFallbackWithoutChangingOtherAccounts(t *testing
 	t.Cleanup(func() { InitKiroHttpClient("") })
 }
 
+func TestResolveProfileArnRefreshFallbackUsesSerializedRefresh(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	account := config.Account{
+		ID:           "profile-refresh-account",
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		AuthMethod:   "idc",
+		Provider:     "Enterprise",
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Region:       "us-east-1",
+		ExpiresAt:    1,
+		Enabled:      false,
+	}
+	if err := config.AddAccount(account); err != nil {
+		t.Fatal(err)
+	}
+	p := accountpool.GetPool()
+	p.ResetRuntimeState()
+	p.Reload()
+	kiroRestHttpStore.Store(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/ListAvailableProfiles" {
+			t.Fatalf("unexpected path: %s", req.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(`{}`)), Header: make(http.Header)}, nil
+	})})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	var calls int
+	refresh := func(a *config.Account) (string, error) {
+		err := refreshAccountTokenSerialized(p, a, true, func(*config.Account) (string, string, int64, string, error) {
+			calls++
+			return "new-access", "new-refresh", time.Now().Add(time.Hour).Unix(), "enterprise-profile", nil
+		})
+		return a.ProfileArn, err
+	}
+	got, err := resolveProfileArnWithRefresh(&account, refresh)
+	if err != nil {
+		t.Fatalf("resolveProfileArnWithRefresh: %v", err)
+	}
+	if got != "enterprise-profile" || calls != 1 {
+		t.Fatalf("got ARN %q and %d refresh calls, want enterprise-profile and 1", got, calls)
+	}
+	stored, ok := config.GetAccount(account.ID)
+	if !ok || stored.AccessToken != "new-access" || stored.RefreshToken != "new-refresh" || stored.ProfileArn != "enterprise-profile" {
+		t.Fatalf("refresh fallback did not persist credentials and ARN: %#v", stored)
+	}
+	if got := p.GetByID(account.ID); got != nil {
+		t.Fatalf("disabled account unexpectedly entered pool: %#v", got)
+	}
+}
+
 func TestBuilderIDProfileFallback(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatal(err)
@@ -162,12 +269,8 @@ func TestBuilderIDProfileFallback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantQuery := ""
-			if tc.account != nil {
-				wantQuery = strings.TrimSpace(tc.account.ProfileArn)
-			}
-			if got := u.Query().Get("profileArn"); got != wantQuery {
-				t.Errorf("query profile ARN = %q, want %q", got, wantQuery)
+			if got := u.Query().Get("profileArn"); got != tc.want {
+				t.Errorf("query profile ARN = %q, want %q", got, tc.want)
 			}
 			if tc.account != nil {
 				got, err := ResolveProfileArn(tc.account)

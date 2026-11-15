@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,21 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+var tokenRefreshMu sync.Mutex
+
+// pendingRefreshCredentials preserves a successful upstream response when the
+// config file cannot be replaced immediately. The source-token fingerprint
+// prevents applying it over credentials installed by a later login.
+type pendingRefreshCredentials struct {
+	sourceTokenHash [32]byte
+	accessToken     string
+	refreshToken    string
+	expiresAt       int64
+	profileArn      string
+}
+
+var pendingRefreshByAccount = make(map[string]pendingRefreshCredentials)
+
 // Handler HTTP 处理器
 type Handler struct {
 	pool *pool.AccountPool
@@ -33,11 +49,10 @@ type Handler struct {
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
 	// 模型缓存
+	promptCache     *promptCacheTracker
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
-	promptCache     *promptCacheTracker
-	tokenRefreshMu  sync.Mutex
 }
 
 type thinkingStreamSource int
@@ -256,6 +271,13 @@ func (h *Handler) backgroundRefresh() {
 
 // refreshAllAccounts 刷新所有账户信息
 func (h *Handler) refreshAllAccounts() {
+	h.refreshAllAccountsWith(auth.RefreshToken, RefreshAccountInfo)
+}
+
+func (h *Handler) refreshAllAccountsWith(
+	refresh func(*config.Account) (string, string, int64, string, error),
+	refreshInfo func(*config.Account) (*config.AccountInfo, error),
+) {
 	accounts := config.GetAccounts()
 	for i := range accounts {
 		account := &accounts[i]
@@ -263,29 +285,15 @@ func (h *Handler) refreshAllAccounts() {
 			continue
 		}
 
-		// 检查 token 是否需要刷新
 		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
-			if err != nil {
+			if err := h.refreshAccountTokenWith(account, false, refresh); err != nil {
 				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
 				h.handleAccountFailure(account, err)
 				continue
 			}
-			account.AccessToken = newAccessToken
-			if newRefreshToken != "" {
-				account.RefreshToken = newRefreshToken
-			}
-			account.ExpiresAt = newExpiresAt
-			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
-			}
 		}
 
-		// 刷新账户信息
-		info, err := RefreshAccountInfo(account)
+		info, err := refreshInfo(account)
 		if err != nil {
 			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
 			continue
@@ -1964,41 +1972,163 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
+	return h.refreshAccountToken(account, false)
+}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+func (h *Handler) refreshAccountToken(account *config.Account, force bool) error {
+	return h.refreshAccountTokenWith(account, force, auth.RefreshToken)
+}
 
-	// Another concurrent request may have refreshed this account while we waited.
-	if latest := h.pool.GetByID(account.ID); latest != nil {
-		account.AccessToken = latest.AccessToken
-		account.RefreshToken = latest.RefreshToken
-		account.ExpiresAt = latest.ExpiresAt
-		account.ProfileArn = latest.ProfileArn
-		if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+// refreshAccountTokenWith delegates to a process-wide coordinator so refreshes
+// from all handlers and profile discovery share the same serialization.
+func (h *Handler) refreshAccountTokenWith(
+	account *config.Account,
+	force bool,
+	refresh func(*config.Account) (string, string, int64, string, error),
+) error {
+	return refreshAccountTokenSerialized(h.pool, account, force, refresh)
+}
+
+func refreshAccountTokenSerialized(
+	p *pool.AccountPool,
+	account *config.Account,
+	force bool,
+	refresh func(*config.Account) (string, string, int64, string, error),
+) error {
+	if account == nil {
+		return fmt.Errorf("account is nil")
+	}
+	accountID := account.ID
+	if accountID == "" {
+		return fmt.Errorf("account ID is empty")
+	}
+
+	tokenRefreshMu.Lock()
+	defer tokenRefreshMu.Unlock()
+
+	latest, ok := config.GetAccount(accountID)
+	if !ok {
+		return fmt.Errorf("account %q not found", accountID)
+	}
+	latestTokenChanged := latest.AccessToken != account.AccessToken ||
+		latest.RefreshToken != account.RefreshToken ||
+		latest.ExpiresAt != account.ExpiresAt
+	*account = latest
+
+	sourceTokenHash := sha256.Sum256([]byte(account.RefreshToken))
+	if pending, ok := pendingRefreshByAccount[accountID]; ok {
+		if pending.sourceTokenHash != sourceTokenHash || !account.RefreshTokenUncertain {
+			delete(pendingRefreshByAccount, accountID)
+		} else {
+			if err := persistAndSyncRefreshedCredentials(p, account, pending); err != nil {
+				if err == config.ErrAccountCredentialsChanged {
+					delete(pendingRefreshByAccount, accountID)
+					if current, exists := config.GetAccount(accountID); exists {
+						*account = current
+					}
+					return err
+				}
+				return fmt.Errorf("persist pending refreshed credentials: %w", err)
+			}
+			delete(pendingRefreshByAccount, accountID)
 			return nil
 		}
 	}
+	if staged, ok := config.GetPendingAccountRefresh(accountID, account.RefreshToken); ok {
+		pending := pendingRefreshCredentials{
+			sourceTokenHash: sourceTokenHash,
+			accessToken:     staged.AccessToken,
+			refreshToken:    staged.RefreshToken,
+			expiresAt:       staged.ExpiresAt,
+			profileArn:      staged.ProfileArn,
+		}
+		if err := persistAndSyncRefreshedCredentials(p, account, pending); err != nil {
+			return fmt.Errorf("persist durable pending refreshed credentials: %w", err)
+		}
+		return nil
+	}
 
-	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(account)
-	if err != nil {
+	tokenIsFresh := account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds
+	if tokenIsFresh && (!force || latestTokenChanged) {
+		return nil
+	}
+	if account.RefreshToken == "" {
+		return fmt.Errorf("account has no refresh token")
+	}
+	if !strings.EqualFold(account.AuthMethod, "social") && (account.ClientID == "" || account.ClientSecret == "") {
+		return fmt.Errorf("OIDC refresh requires clientId and clientSecret")
+	}
+	if account.RefreshTokenUncertain {
+		return config.ErrRefreshOutcomeUnknown
+	}
+	if err := config.BeginAccountTokenRefresh(accountID, account.RefreshToken); err != nil {
+		if err == config.ErrAccountCredentialsChanged {
+			if current, exists := config.GetAccount(accountID); exists {
+				*account = current
+			}
+		}
 		return err
 	}
+	account.RefreshTokenUncertain = true
 
-	// 更新内存
-	h.pool.UpdateToken(account.ID, accessToken, refreshToken, expiresAt)
-	account.AccessToken = accessToken
-	if refreshToken != "" {
-		account.RefreshToken = refreshToken
+	accessToken, refreshToken, expiresAt, profileArn, err := refresh(account)
+	if err != nil {
+		return fmt.Errorf("refresh outcome unknown; grant will not be replayed: %w", err)
 	}
-	account.ExpiresAt = expiresAt
-	if profileArn != "" {
-		account.ProfileArn = profileArn
-		config.UpdateAccountProfileArn(account.ID, profileArn)
+	if accessToken == "" {
+		return fmt.Errorf("refresh outcome unknown: upstream returned no access token")
 	}
+	pending := pendingRefreshCredentials{
+		sourceTokenHash: sourceTokenHash,
+		accessToken:     accessToken,
+		refreshToken:    refreshToken,
+		expiresAt:       expiresAt,
+		profileArn:      profileArn,
+	}
+	stageErr := config.StageAccountRefreshCredentials(accountID, account.RefreshToken, accessToken, refreshToken, expiresAt, profileArn)
+	if stageErr == config.ErrAccountCredentialsChanged {
+		if current, exists := config.GetAccount(accountID); exists {
+			*account = current
+		}
+		return stageErr
+	}
+	if err := persistAndSyncRefreshedCredentials(p, account, pending); err != nil {
+		if err == config.ErrAccountCredentialsChanged {
+			if current, exists := config.GetAccount(accountID); exists {
+				*account = current
+			}
+			return err
+		}
+		pendingRefreshByAccount[accountID] = pending
+		if stageErr != nil {
+			return fmt.Errorf("could not stage refreshed credentials (%v) or commit them: %w", stageErr, err)
+		}
+		return fmt.Errorf("persist refreshed credentials: %w", err)
+	}
+	delete(pendingRefreshByAccount, accountID)
+	return nil
+}
 
-	// 持久化
-	config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
-
+func persistAndSyncRefreshedCredentials(p *pool.AccountPool, account *config.Account, pending pendingRefreshCredentials) error {
+	if err := config.UpdateAccountCredentialsForRefresh(account.ID, account.RefreshToken, pending.accessToken, pending.refreshToken, pending.expiresAt, pending.profileArn); err != nil {
+		return err
+	}
+	account.AccessToken = pending.accessToken
+	if pending.refreshToken != "" {
+		account.RefreshToken = pending.refreshToken
+	}
+	account.ExpiresAt = pending.expiresAt
+	account.RefreshTokenUncertain = false
+	account.PendingRefresh = nil
+	if pending.profileArn != "" {
+		account.ProfileArn = pending.profileArn
+	}
+	if p != nil {
+		p.UpdateToken(account.ID, pending.accessToken, pending.refreshToken, pending.expiresAt)
+		if pending.profileArn != "" {
+			p.UpdateProfileArn(account.ID, pending.profileArn)
+		}
+	}
 	return nil
 }
 
@@ -2345,20 +2475,12 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 				failCount++
 				continue
 			}
-			// 刷新 token
+			// Refresh through the shared lock so two callers cannot consume the
+			// same rotating refresh token at once.
 			if account.RefreshToken != "" {
-				if newAccess, newRefresh, newExpires, profileArn, err := auth.RefreshToken(account); err == nil {
-					account.AccessToken = newAccess
-					if newRefresh != "" {
-						account.RefreshToken = newRefresh
-					}
-					account.ExpiresAt = newExpires
-					config.UpdateAccountToken(id, newAccess, newRefresh, newExpires)
-					if profileArn != "" {
-						account.ProfileArn = profileArn
-						config.UpdateAccountProfileArn(id, profileArn)
-					}
-					h.pool.UpdateToken(id, newAccess, newRefresh, newExpires)
+				if err := h.refreshAccountToken(account, true); err != nil {
+					failCount++
+					continue
 				}
 			}
 			// 刷新账户信息
@@ -2962,27 +3084,9 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
-	// 先尝试刷新 token（不管是否过期，确保 token 有效）
+	// 使用共享刷新锁，避免与模型缓存/请求处理并发消费同一刷新令牌。
 	refreshTokenIfNeeded := func() error {
-		if account.RefreshToken == "" {
-			return nil
-		}
-		newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
-		if err != nil {
-			return err
-		}
-		account.AccessToken = newAccessToken
-		if newRefreshToken != "" {
-			account.RefreshToken = newRefreshToken
-		}
-		account.ExpiresAt = newExpiresAt
-		config.UpdateAccountToken(id, newAccessToken, newRefreshToken, newExpiresAt)
-		h.pool.UpdateToken(id, newAccessToken, newRefreshToken, newExpiresAt)
-		if profileArn != "" {
-			account.ProfileArn = profileArn
-			config.UpdateAccountProfileArn(id, profileArn)
-		}
-		return nil
+		return h.refreshAccountToken(account, true)
 	}
 
 	// 检查 token 是否快过期，先刷新

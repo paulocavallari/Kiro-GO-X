@@ -7,6 +7,7 @@ import (
 	"kiro-go-x/auth"
 	"kiro-go-x/config"
 	"kiro-go-x/logger"
+	accountpool "kiro-go-x/pool"
 	"math"
 	"net/http"
 	neturl "net/url"
@@ -117,8 +118,17 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 }
 
 // ResolveProfileArn returns the explicit ARN or the Builder ID default. For other
-// accounts it discovers and caches an ARN via profiles or token refresh.
+// accounts it discovers and caches an ARN via profiles or the shared token refresh coordinator.
 func ResolveProfileArn(account *config.Account) (string, error) {
+	return resolveProfileArnWithRefresh(account, func(account *config.Account) (string, error) {
+		if err := refreshAccountTokenSerialized(accountpool.GetPool(), account, true, auth.RefreshToken); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(account.ProfileArn), nil
+	})
+}
+
+func resolveProfileArnWithRefresh(account *config.Account, refresh func(*config.Account) (string, error)) (string, error) {
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
 	}
@@ -126,25 +136,28 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return profileArn, nil
 	}
 
-	// Try ListAvailableProfiles first
+	// Try ListAvailableProfiles first.
 	profileArn, err := listAvailableProfiles(account)
 	if err == nil && profileArn != "" {
 		if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
 			logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+		} else {
+			account.ProfileArn = profileArn
+			if p := accountpool.GetPool(); p != nil {
+				p.UpdateProfileArn(account.ID, profileArn)
+			}
 		}
-		account.ProfileArn = profileArn
 		return profileArn, nil
 	}
 
-	// Fallback: refresh token to get profileArn from auth response
-	if account.RefreshToken != "" {
-		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
-		if refreshErr == nil && refreshedArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+	// Fall back to the shared coordinator so a profile lookup cannot consume a
+	// refresh token concurrently or discard a rotated credential.
+	if account.RefreshToken != "" && refresh != nil {
+		if refreshedArn, refreshErr := refresh(account); refreshErr == nil {
+			if refreshedArn = strings.TrimSpace(refreshedArn); refreshedArn != "" {
+				account.ProfileArn = refreshedArn
+				return refreshedArn, nil
 			}
-			account.ProfileArn = refreshedArn
-			return refreshedArn, nil
 		}
 	}
 
@@ -198,10 +211,7 @@ func effectiveProfileArn(account *config.Account) string {
 }
 
 func withProfileArnQuery(rawURL string, account *config.Account) string {
-	profileArn := ""
-	if account != nil {
-		profileArn = strings.TrimSpace(account.ProfileArn)
-	}
+	profileArn := effectiveProfileArn(account)
 	if profileArn == "" {
 		return rawURL
 	}

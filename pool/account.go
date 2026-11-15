@@ -85,6 +85,18 @@ func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
+func accountSnapshot(account *config.Account) *config.Account {
+	if account == nil {
+		return nil
+	}
+	copy := *account
+	if account.PendingRefresh != nil {
+		pending := *account.PendingRefresh
+		copy.PendingRefresh = &pending
+	}
+	return &copy
+}
+
 // GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
 	p.mu.RLock()
@@ -130,7 +142,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		return acc
+		return accountSnapshot(acc)
 	}
 
 	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
@@ -151,10 +163,10 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return accountSnapshot(acc)
 		}
 	}
-	return best
+	return accountSnapshot(best)
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -242,7 +254,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		return acc
+		return accountSnapshot(acc)
 	}
 
 	// fallback：找冷却时间最短且支持该模型的账号
@@ -265,19 +277,19 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return accountSnapshot(acc)
 		}
 	}
-	return best
+	return accountSnapshot(best)
 }
 
-// GetByID 根据 ID 获取账号
+// GetByID 根据 ID 获取账号快照
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			return accountSnapshot(&p.accounts[i])
 		}
 	}
 	return nil
@@ -407,6 +419,18 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 				p.accounts[i].RefreshToken = refreshToken
 			}
 			p.accounts[i].ExpiresAt = expiresAt
+			p.accounts[i].RefreshTokenUncertain = false
+			p.accounts[i].PendingRefresh = nil
+		}
+	}
+}
+
+func (p *AccountPool) UpdateProfileArn(id, profileArn string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			p.accounts[i].ProfileArn = profileArn
 		}
 	}
 }
@@ -487,7 +511,9 @@ func (p *AccountPool) GetAllAccounts() []config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	result := make([]config.Account, len(p.accounts))
-	copy(result, p.accounts)
+	for i := range p.accounts {
+		result[i] = *accountSnapshot(&p.accounts[i])
+	}
 	return result
 }
 

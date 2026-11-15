@@ -8,6 +8,38 @@ import (
 	"time"
 )
 
+func TestPoolAccountReadsReturnSnapshots(t *testing.T) {
+	p := newTestPool(config.Account{
+		ID: "snapshot-account", AccessToken: "original-access", RefreshToken: "original-refresh",
+		PendingRefresh: &config.PendingAccountRefresh{AccessToken: "staged-access", RefreshToken: "staged-refresh"},
+	})
+
+	selected := p.GetNext()
+	if selected == nil {
+		t.Fatal("expected selected account")
+	}
+	selected.AccessToken = "mutated-selection"
+	selected.PendingRefresh.AccessToken = "mutated-pending-selection"
+
+	lookedUp := p.GetByID("snapshot-account")
+	if lookedUp == nil {
+		t.Fatal("expected account lookup")
+	}
+	lookedUp.RefreshToken = "mutated-lookup"
+	lookedUp.PendingRefresh.RefreshToken = "mutated-pending-lookup"
+
+	all := p.GetAllAccounts()
+	all[0].PendingRefresh.AccessToken = "mutated-list"
+
+	stored := p.GetByID("snapshot-account")
+	if stored == nil || stored.AccessToken != "original-access" || stored.RefreshToken != "original-refresh" {
+		t.Fatalf("caller mutated pool state through returned account pointer: %#v", stored)
+	}
+	if stored.PendingRefresh == nil || stored.PendingRefresh.AccessToken != "staged-access" || stored.PendingRefresh.RefreshToken != "staged-refresh" {
+		t.Fatalf("caller mutated pool pending credentials through returned account pointer: %#v", stored)
+	}
+}
+
 func TestOverageAccountsAreSkippedByDefault(t *testing.T) {
 	p := &AccountPool{}
 	normal := config.Account{ID: "normal"}

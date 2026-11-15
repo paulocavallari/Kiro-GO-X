@@ -12,9 +12,13 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -32,6 +36,18 @@ func GenerateMachineId() string {
 		bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16])
 }
 
+// PendingAccountRefresh is a successfully received upstream token rotation that
+// has not yet been committed as the account's active credentials.
+// SourceRefreshTokenHash binds it to the grant that produced these credentials
+// without storing a second copy of that source token.
+type PendingAccountRefresh struct {
+	SourceRefreshTokenHash string `json:"sourceRefreshTokenHash"`
+	AccessToken            string `json:"accessToken"`
+	RefreshToken           string `json:"refreshToken,omitempty"`
+	ExpiresAt              int64  `json:"expiresAt"`
+	ProfileArn             string `json:"profileArn,omitempty"`
+}
+
 // Account represents a Kiro API account with authentication credentials and usage statistics.
 type Account struct {
 	// Basic identification
@@ -41,17 +57,19 @@ type Account struct {
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
 	// Authentication credentials
-	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
-	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
-	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
-	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC) or "social" (GitHub/Google)
-	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub")
-	Region       string `json:"region"`                 // AWS region for OIDC endpoints
-	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
-	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
-	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
-	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+	AccessToken           string                 `json:"accessToken"`                     // OAuth access token for API calls
+	RefreshToken          string                 `json:"refreshToken"`                    // OAuth refresh token for token renewal
+	ClientID              string                 `json:"clientId,omitempty"`              // OIDC client ID (for IdC auth)
+	ClientSecret          string                 `json:"clientSecret,omitempty"`          // OIDC client secret (for IdC auth)
+	AuthMethod            string                 `json:"authMethod"`                      // Authentication method: "idc" (AWS IdC) or "social" (GitHub/Google)
+	Provider              string                 `json:"provider,omitempty"`              // Identity provider name (e.g., "BuilderId", "GitHub")
+	Region                string                 `json:"region"`                          // AWS region for OIDC endpoints
+	StartUrl              string                 `json:"startUrl,omitempty"`              // AWS SSO start URL
+	ExpiresAt             int64                  `json:"expiresAt,omitempty"`             // Token expiration timestamp (Unix seconds)
+	MachineId             string                 `json:"machineId,omitempty"`             // UUID machine identifier for request tracking
+	ProfileArn            string                 `json:"profileArn,omitempty"`            // CodeWhisperer/Kiro profile ARN for generation requests
+	RefreshTokenUncertain bool                   `json:"refreshTokenUncertain,omitempty"` // Last refresh grant may have been consumed without a usable response
+	PendingRefresh        *PendingAccountRefresh `json:"pendingRefresh,omitempty"`        // Durable rotation waiting for config commit
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -214,6 +232,9 @@ var (
 	cfg     *Config
 	cfgLock sync.RWMutex
 	cfgPath string
+
+	ErrAccountCredentialsChanged = errors.New("account credentials changed during refresh")
+	ErrRefreshOutcomeUnknown     = errors.New("refresh outcome is unknown; replace credentials before retrying")
 )
 
 // Init initializes the configuration system with the specified file path.
@@ -300,12 +321,123 @@ func GetHost() string {
 	return cfg.Host
 }
 
+func cloneAccount(account Account) Account {
+	if account.PendingRefresh != nil {
+		pending := *account.PendingRefresh
+		account.PendingRefresh = &pending
+	}
+	return account
+}
+
 func GetAccounts() []Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	accounts := make([]Account, len(cfg.Accounts))
-	copy(accounts, cfg.Accounts)
+	for i, account := range cfg.Accounts {
+		accounts[i] = cloneAccount(account)
+	}
 	return accounts
+}
+
+func GetAccount(id string) (Account, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.ID == id {
+			return cloneAccount(account), true
+		}
+	}
+	return Account{}, false
+}
+
+// BeginAccountTokenRefresh durably records that the current refresh token is
+// about to be used. If the upstream result is lost, callers must not replay it
+// until credentials are replaced or a refresh succeeds.
+func BeginAccountTokenRefresh(id, expectedRefreshToken string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, current := range cfg.Accounts {
+		if current.ID != id {
+			continue
+		}
+		if current.RefreshToken != expectedRefreshToken {
+			return ErrAccountCredentialsChanged
+		}
+		if current.RefreshTokenUncertain {
+			return ErrRefreshOutcomeUnknown
+		}
+		updated := current
+		updated.RefreshTokenUncertain = true
+		candidate := *cfg
+		candidate.Accounts = append([]Account(nil), cfg.Accounts...)
+		candidate.Accounts[i] = updated
+		if err := writeConfigAtomically(&candidate); err != nil {
+			return err
+		}
+		cfg.Accounts[i] = updated
+		return nil
+	}
+	return fmt.Errorf("account %q not found", id)
+}
+
+// StageAccountRefreshCredentials durably records tokens returned by a successful
+// upstream grant before the active account credentials are replaced.
+func StageAccountRefreshCredentials(id, expectedRefreshToken, accessToken, refreshToken string, expiresAt int64, profileArn string) error {
+	if accessToken == "" {
+		return fmt.Errorf("cannot stage an empty access token")
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, current := range cfg.Accounts {
+		if current.ID != id {
+			continue
+		}
+		if current.RefreshToken != expectedRefreshToken {
+			return ErrAccountCredentialsChanged
+		}
+		if !current.RefreshTokenUncertain {
+			return ErrAccountCredentialsChanged
+		}
+		updated := current
+		updated.PendingRefresh = &PendingAccountRefresh{
+			SourceRefreshTokenHash: refreshTokenFingerprint(expectedRefreshToken),
+			AccessToken:            accessToken,
+			RefreshToken:           refreshToken,
+			ExpiresAt:              expiresAt,
+			ProfileArn:             profileArn,
+		}
+		candidate := *cfg
+		candidate.Accounts = append([]Account(nil), cfg.Accounts...)
+		candidate.Accounts[i] = updated
+		if err := writeConfigAtomically(&candidate); err != nil {
+			return err
+		}
+		cfg.Accounts[i] = updated
+		return nil
+	}
+	return fmt.Errorf("account %q not found", id)
+}
+
+// GetPendingAccountRefresh returns a staged token rotation only when it matches
+// the account's current source token and the refresh outcome is still uncertain.
+func GetPendingAccountRefresh(id, expectedRefreshToken string) (PendingAccountRefresh, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.ID != id || account.RefreshToken != expectedRefreshToken || !account.RefreshTokenUncertain || account.PendingRefresh == nil {
+			continue
+		}
+		if account.PendingRefresh.SourceRefreshTokenHash != refreshTokenFingerprint(expectedRefreshToken) {
+			return PendingAccountRefresh{}, false
+		}
+		return *account.PendingRefresh, true
+	}
+	return PendingAccountRefresh{}, false
+}
+
+func refreshTokenFingerprint(refreshToken string) string {
+	fingerprint := sha256.Sum256([]byte(refreshToken))
+	return hex.EncodeToString(fingerprint[:])
 }
 
 func GetEnabledAccounts() []Account {
@@ -314,7 +446,7 @@ func GetEnabledAccounts() []Account {
 	var accounts []Account
 	for _, a := range cfg.Accounts {
 		if a.Enabled {
-			accounts = append(accounts, a)
+			accounts = append(accounts, cloneAccount(a))
 		}
 	}
 	return accounts
@@ -323,6 +455,8 @@ func GetEnabledAccounts() []Account {
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	account.RefreshTokenUncertain = false
+	account.PendingRefresh = nil
 	cfg.Accounts = append(cfg.Accounts, account)
 	return Save()
 }
@@ -330,11 +464,27 @@ func AddAccount(account Account) error {
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts[i] = account
-			return Save()
+	for i, current := range cfg.Accounts {
+		if current.ID != id {
+			continue
 		}
+		// UpdateAccount is used for metadata/status edits. Credential changes
+		// must go through the explicit token-update functions so a stale admin
+		// snapshot cannot overwrite a concurrently rotated token.
+		account.AccessToken = current.AccessToken
+		account.RefreshToken = current.RefreshToken
+		account.ClientID = current.ClientID
+		account.ClientSecret = current.ClientSecret
+		account.AuthMethod = current.AuthMethod
+		account.Provider = current.Provider
+		account.Region = current.Region
+		account.StartUrl = current.StartUrl
+		account.ExpiresAt = current.ExpiresAt
+		account.ProfileArn = current.ProfileArn
+		account.RefreshTokenUncertain = current.RefreshTokenUncertain
+		account.PendingRefresh = cloneAccount(current).PendingRefresh
+		cfg.Accounts[i] = account
+		return Save()
 	}
 	return nil
 }
@@ -393,11 +543,20 @@ func SetAccountBanStatus(id, status, reason string) error {
 func UpdateAccountProfileArn(id, profileArn string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+	for i, account := range cfg.Accounts {
+		if account.ID != id {
+			continue
 		}
+		updated := account
+		updated.ProfileArn = profileArn
+		candidate := *cfg
+		candidate.Accounts = append([]Account(nil), cfg.Accounts...)
+		candidate.Accounts[i] = updated
+		if err := writeConfigAtomically(&candidate); err != nil {
+			return err
+		}
+		cfg.Accounts[i] = updated
+		return nil
 	}
 	return nil
 }
@@ -415,19 +574,111 @@ func DeleteAccount(id string) error {
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
+	return updateAccountCredentials(id, accessToken, refreshToken, expiresAt, "", true)
+}
+
+// UpdateAccountCredentials atomically persists new token credentials and an
+// optional profile ARN before exposing them through the in-memory config.
+func UpdateAccountCredentials(id, accessToken, refreshToken string, expiresAt int64, profileArn string) error {
+	return updateAccountCredentials(id, accessToken, refreshToken, expiresAt, profileArn, false)
+}
+
+// UpdateAccountCredentialsForRefresh applies a refresh result only while the
+// expected source token and its durable in-progress marker are still current.
+func UpdateAccountCredentialsForRefresh(id, expectedRefreshToken, accessToken, refreshToken string, expiresAt int64, profileArn string) error {
+	return updateAccountCredentialsIfExpected(id, expectedRefreshToken, accessToken, refreshToken, expiresAt, profileArn, false, true)
+}
+
+func updateAccountCredentials(id, accessToken, refreshToken string, expiresAt int64, profileArn string, missingOK bool) error {
+	return updateAccountCredentialsIfExpected(id, "", accessToken, refreshToken, expiresAt, profileArn, missingOK, false)
+}
+
+func updateAccountCredentialsIfExpected(id, expectedRefreshToken, accessToken, refreshToken string, expiresAt int64, profileArn string, missingOK, checkExpected bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts[i].AccessToken = accessToken
-			if refreshToken != "" {
-				cfg.Accounts[i].RefreshToken = refreshToken
-			}
-			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+	for i, current := range cfg.Accounts {
+		if current.ID != id {
+			continue
 		}
+		if checkExpected {
+			if current.RefreshToken != expectedRefreshToken || !current.RefreshTokenUncertain {
+				return ErrAccountCredentialsChanged
+			}
+		}
+		updated := current
+		updated.AccessToken = accessToken
+		if refreshToken != "" {
+			updated.RefreshToken = refreshToken
+		}
+		updated.ExpiresAt = expiresAt
+		updated.RefreshTokenUncertain = false
+		updated.PendingRefresh = nil
+		if profileArn != "" {
+			updated.ProfileArn = profileArn
+		}
+
+		candidate := *cfg
+		candidate.Accounts = append([]Account(nil), cfg.Accounts...)
+		candidate.Accounts[i] = updated
+		if err := writeConfigAtomically(&candidate); err != nil {
+			return err
+		}
+		cfg.Accounts[i] = updated
+		return nil
 	}
-	return nil
+	if missingOK {
+		return nil
+	}
+	return fmt.Errorf("account %q not found", id)
+}
+
+func writeConfigAtomically(candidate *Config) error {
+	data, err := json.MarshalIndent(candidate, "", "  ")
+	if err != nil {
+		return err
+	}
+	mode := os.FileMode(0600)
+	if info, statErr := os.Stat(cfgPath); statErr == nil {
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	file, err := os.CreateTemp(filepath.Dir(cfgPath), ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, cfgPath); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(filepath.Dir(cfgPath))
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 func GetApiKey() string {
